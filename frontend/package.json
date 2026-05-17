@@ -7,9 +7,17 @@
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^13.5.0",
+    "axios": "^1.16.1",
+    "chart.js": "^4.5.1",
+    "https-browserify": "^1.0.0",
     "react": "^19.2.6",
+    "react-app-rewired": "^2.2.1",
+    "react-chartjs-2": "^5.3.1",
     "react-dom": "^19.2.6",
+    "react-router-dom": "^7.15.1",
     "react-scripts": "5.0.1",
+    "stream-http": "^3.2.0",
+    "url": "^0.11.4",
     "web-vitals": "^2.1.4"
   },
   "scripts": {
@@ -35,5 +43,6 @@
       "last 1 firefox version",
       "last 1 safari version"
     ]
-  }
+  },
+  "proxy": "http://127.0.0.1:8000"
 }
