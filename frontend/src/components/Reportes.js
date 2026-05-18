@@ -1,38 +1,42 @@
 import React, { useEffect, useState } from "react";
 import axios from "axios";
-import { Bar } from "react-chartjs-2";
+import { Bar, Line } from "react-chartjs-2";
 import {
   Chart as ChartJS,
   CategoryScale,
   LinearScale,
   BarElement,
+  LineElement,
+  PointElement,
   Title,
   Tooltip,
   Legend,
 } from "chart.js";
 
-ChartJS.register(CategoryScale, LinearScale, BarElement, Title, Tooltip, Legend);
+ChartJS.register(
+  CategoryScale, LinearScale, BarElement,
+  LineElement, PointElement, Title, Tooltip, Legend
+);
 
 function Reportes() {
   const [dataFacultades, setDataFacultades] = useState([]);
   const [dataProgramas, setDataProgramas] = useState([]);
   const [facultad, setFacultad] = useState("Todos");
+  const [periodo, setPeriodo] = useState("Todos");
 
   useEffect(() => {
-    // 🔹 Datos por facultad
     axios
-      .get("http://127.0.0.1:8000/desercion_por_facultad")
+      .get(`http://127.0.0.1:8000/detalle_facultad?periodo=${periodo}`)
       .then((res) => setDataFacultades(res.data))
       .catch((err) => console.error(err));
 
-    // 🔹 Datos por programa
     axios
-      .get("http://127.0.0.1:8000/desercion_por_programa")
+      .get(`http://127.0.0.1:8000/desercion_por_programa?periodo=${periodo}`)
       .then((res) => setDataProgramas(res.data))
       .catch((err) => console.error(err));
-  }, []);
+  }, [periodo]);
 
-  // 🔹 Filtrado simple por facultad
+  // Filtro por facultad
   const filteredFacultades =
     facultad === "Todos"
       ? dataFacultades
@@ -43,45 +47,144 @@ function Reportes() {
       ? dataProgramas
       : dataProgramas.filter((d) => d.facultad === facultad);
 
-  // 🔹 Gráfico por facultad
-  const chartFacultades = {
-    labels: filteredFacultades.map((d) => d.facultad),
+  // ✅ Agrupar por programa para la TABLA (sumar matriculados y desertores)
+  const programasAgrupados = Object.values(
+    filteredProgramas.reduce((acc, row) => {
+      const key = row.programa;
+      if (!acc[key]) {
+        acc[key] = {
+          programa: row.programa,
+          facultad: row.facultad,
+          matriculados: 0,
+          desertores: 0,
+        };
+      }
+      acc[key].matriculados += row.matriculados;
+      acc[key].desertores += row.desertores;
+      return acc;
+    }, {})
+  ).map((r) => ({
+    ...r,
+    tasa: ((r.desertores / r.matriculados) * 100).toFixed(2),
+  }));
+
+  // ✅ Gráfico de barras — usa programas agrupados
+  const chartProgramasBar = {
+    labels: programasAgrupados.map((d) => d.programa),
     datasets: [
       {
         label: "% Deserción",
-        data: filteredFacultades.map((d) => d.porcentaje_desercion),
-        backgroundColor: ["#4e79a7", "#e15759", "#76b7b2", "#f28e2b"],
+        data: programasAgrupados.map((d) => parseFloat(d.tasa)),
+        backgroundColor: ["#4e79a7", "#e15759", "#76b7b2", "#f28e2b",
+          "#59a14f", "#edc948", "#b07aa1", "#ff9da7"],
         barThickness: 40,
       },
     ],
   };
 
+  // ✅ Gráfico de líneas — usa filas con periodo (datos sin agrupar)
+  const periodos = [...new Set(filteredProgramas.map((d) => d.periodo))].sort();
+  const facultadesUnicas = [...new Set(filteredProgramas.map((d) => d.facultad))];
+  const colores = ["#4e79a7", "#e15759", "#76b7b2", "#f28e2b", "#59a14f"];
+
+  const chartFacultadesLine = {
+    labels: periodos,
+    datasets: facultadesUnicas.map((fac, idx) => ({
+      label: fac,
+      data: periodos.map((per) => {
+        const filas = filteredProgramas.filter(
+          (d) => d.facultad === fac && d.periodo === per
+        );
+        if (filas.length === 0) return null;
+        const totalMat = filas.reduce((s, d) => s + d.matriculados, 0);
+        const totalDes = filas.reduce((s, d) => s + d.desertores, 0);
+        return parseFloat(((totalDes / totalMat) * 100).toFixed(2));
+      }),
+      borderColor: colores[idx % colores.length],
+      backgroundColor: colores[idx % colores.length],
+      fill: false,
+      tension: 0.3,
+      spanGaps: false,
+    })),
+  };
+
+  // Resumen
+  const totalMat = programasAgrupados.reduce((s, d) => s + d.matriculados, 0);
+  const totalDes = programasAgrupados.reduce((s, d) => s + d.desertores, 0);
+  const tasaGlobal = totalMat > 0 ? ((totalDes / totalMat) * 100).toFixed(2) : "-";
+
+  const mayorRiesgo =
+    filteredFacultades.length > 0
+      ? filteredFacultades.reduce((a, b) =>
+          (a.porcentaje_desercion || 0) > (b.porcentaje_desercion || 0) ? a : b
+        ).facultad
+      : "-";
+
   return (
     <div style={{ padding: "20px" }}>
       <h2>Reportes</h2>
 
-      {/* 🔹 Filtros arriba */}
+      {/* Filtros */}
       <div style={{ display: "flex", gap: "10px", marginBottom: "20px" }}>
         <select value={facultad} onChange={(e) => setFacultad(e.target.value)}>
-          <option>Todos</option>
-          <option>Ingeniería</option>
-          <option>Economía</option>
-          <option>Derecho</option>
-          <option>Filosofía</option>
+          <option value="Todos">Todos</option>
+          <option value="Ingeniería">Ingeniería</option>
+          <option value="Ciencias Económicas">Ciencias Económicas</option>
+          <option value="Ciencias Jurídicas">Ciencias Jurídicas</option>
+          <option value="Filosofía">Filosofía</option>
+        </select>
+
+        <select value={periodo} onChange={(e) => setPeriodo(e.target.value)}>
+          <option value="Todos">Todos los periodos</option>
+          <option value="2024-1">2024-1</option>
+          <option value="2024-2">2024-2</option>
+          <option value="2025-1">2025-1</option>
         </select>
       </div>
 
-      {/* 🔹 Sección 1: gráfico + tabla + resumen */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "20px" }}>
-        {/* Gráfico por facultad */}
+      {/* Fila 1: barras + tabla programas */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "20px", marginBottom: "20px" }}>
         <div style={{ background: "#fff", padding: "20px", borderRadius: "8px" }}>
-          <h3>Tasa de deserción por facultad</h3>
-          <Bar data={chartFacultades} />
+          <h3>Tasa de deserción por programa</h3>
+          <Bar data={chartProgramasBar} />
         </div>
 
-        {/* Tabla detalle por facultad */}
         <div style={{ background: "#fff", padding: "20px", borderRadius: "8px" }}>
-          <h3>Detalle</h3>
+          <h3>Detalle por programa</h3>
+          <table border="1" cellPadding="8" style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead style={{ backgroundColor: "#eee" }}>
+              <tr>
+                <th>Programa</th>
+                <th>Facultad</th>
+                <th>Matriculados</th>
+                <th>Desertores</th>
+                <th>Tasa</th>
+              </tr>
+            </thead>
+            <tbody>
+              {programasAgrupados.map((row, idx) => (
+                <tr key={idx}>
+                  <td>{row.programa}</td>
+                  <td>{row.facultad}</td>
+                  <td>{row.matriculados}</td>
+                  <td>{row.desertores}</td>
+                  <td>{row.tasa}%</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Fila 2: líneas + tabla facultades */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "20px", marginBottom: "20px" }}>
+        <div style={{ background: "#fff", padding: "20px", borderRadius: "8px" }}>
+          <h3>Evolución por periodo</h3>
+          <Line data={chartFacultadesLine} />
+        </div>
+
+        <div style={{ background: "#fff", padding: "20px", borderRadius: "8px" }}>
+          <h3>Detalle por facultad</h3>
           <table border="1" cellPadding="8" style={{ width: "100%", borderCollapse: "collapse" }}>
             <thead style={{ backgroundColor: "#eee" }}>
               <tr>
@@ -99,72 +202,16 @@ function Reportes() {
             </tbody>
           </table>
         </div>
-
-        {/* Resumen */}
-        <div
-          style={{
-            background: "#fff",
-            padding: "20px",
-            borderRadius: "8px",
-            gridColumn: "span 2",
-          }}
-        >
-          <h3>Resumen</h3>
-          <p>Total facultades: {filteredFacultades.length}</p>
-          <p>
-            Mayor riesgo:{" "}
-            {filteredFacultades.length > 0
-              ? filteredFacultades.reduce((a, b) =>
-                  a.porcentaje_desercion > b.porcentaje_desercion ? a : b
-                ).facultad
-              : "-"}
-          </p>
-          <p>
-            Tasa global:{" "}
-            {filteredFacultades.length > 0
-              ? (
-                  filteredFacultades.reduce(
-                    (sum, d) => sum + d.porcentaje_desercion,
-                    0
-                  ) / filteredFacultades.length
-                ).toFixed(2) + "%"
-              : "-"}
-          </p>
-        </div>
       </div>
 
-      {/* 🔹 Sección 2: detalle por programa */}
-      <div
-        style={{
-          background: "#fff",
-          padding: "20px",
-          borderRadius: "8px",
-          marginTop: "30px",
-        }}
-      >
-        <h3>Detalle por programa</h3>
-        <table border="1" cellPadding="8" style={{ width: "100%", borderCollapse: "collapse" }}>
-          <thead style={{ backgroundColor: "#eee" }}>
-            <tr>
-              <th>Programa</th>
-              <th>Facultad</th>
-              <th>Matriculados</th>
-              <th>Desertores</th>
-              <th>Tasa</th>
-            </tr>
-          </thead>
-          <tbody>
-            {filteredProgramas.map((row, idx) => (
-              <tr key={idx}>
-                <td>{row.programa}</td>
-                <td>{row.facultad}</td>
-                <td>{row.matriculados}</td>
-                <td>{row.desertores}</td>
-                <td>{row.tasa}%</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      {/* Resumen */}
+      <div style={{ background: "#fff", padding: "20px", borderRadius: "8px", marginTop: "20px" }}>
+        <h3>Resumen</h3>
+        <p>Total facultades: {filteredFacultades.length}</p>
+        <p>Mayor riesgo: {mayorRiesgo}</p>
+        <p>Tasa global: {tasaGlobal}%</p>
+        <p>Total desertores: {totalDes}</p>
+        <p>Total matriculados: {totalMat}</p>
       </div>
     </div>
   );
