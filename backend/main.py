@@ -5,6 +5,9 @@ from typing import List, Dict, Optional
 import mysql.connector
 import csv, io
 from datetime import date
+import pickle
+import os
+import numpy as np
 
 app = FastAPI()
 
@@ -661,6 +664,397 @@ async def cargar_notas(file: UploadFile = File(...)):
         "omitidos": omitidos,
         "errores": errores[:20],  # máximo 20 errores
         "mensaje": f"{insertados} notas cargadas, {omitidos} ya existían, {len(errores)} errores"
+    }
+    
+# ─── PREDICCIONES ────────────────────────────────────────────────
+   
+# ─── Cargar modelo entrenado ──────────────────────────────────────────────────
+
+modelo_cache = None
+
+def cargar_modelo():
+    global modelo_cache
+
+    if modelo_cache is None:
+        ruta_modelo = os.path.join(os.path.dirname(__file__), "modelo.pkl")
+
+        if not os.path.exists(ruta_modelo):
+            raise HTTPException(
+                status_code=500,
+                detail="No se encontró modelo.pkl. Ejecuta modelo_prediccion.py"
+            )
+
+        with open(ruta_modelo, "rb") as f:
+            modelo_cache = pickle.load(f)
+
+    return modelo_cache
+ 
+@app.get("/predicciones/resumen")
+def predicciones_resumen(periodo: str = "Todos"):
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+ 
+    modelo_data = cargar_modelo()
+    modelo      = modelo_data["modelo"]
+    precision   = modelo_data["precision"]
+ 
+    where = f"AND m.periodo = '{periodo}'" if periodo != "Todos" else ""
+ 
+    cursor.execute(f"""
+        SELECT 
+            e.id_estudiante,
+            e.nombre,
+            p.nombre AS programa,
+            p.facultad,
+            m.periodo,
+            COALESCE(AVG(n.valor), 0)          AS promedio_general,
+            COUNT(n.id_nota)                    AS num_notas,
+            COALESCE(SUM(CASE WHEN n.valor < 3.0 THEN 1 ELSE 0 END) 
+                / NULLIF(COUNT(n.id_nota),0), 0) AS prop_reprobadas,
+            COALESCE(MIN(n.valor), 0)           AS nota_minima,
+            COUNT(DISTINCT m.periodo)           AS num_periodos,
+            SUM(CASE WHEN m.estado='Desertor' THEN 1 ELSE 0 END) AS materias_desercion,
+            COALESCE(AVG(CASE 
+                WHEN rn.sentimiento='Positivo' THEN 1
+                WHEN rn.sentimiento='Neutro'   THEN 0
+                ELSE -1 END), 0)               AS sentimiento_promedio
+        FROM estudiante e
+        JOIN matricula m ON m.id_estudiante = e.id_estudiante
+        JOIN programa p ON p.id_programa = e.id_programa
+        LEFT JOIN nota n ON n.id_matricula = m.id_matricula
+        LEFT JOIN respuesta r ON r.id_estudiante = e.id_estudiante
+        LEFT JOIN resultado_npl rn ON rn.id_respuesta = r.id_respuesta
+        WHERE 1=1 {where}
+        GROUP BY e.id_estudiante, e.nombre, p.nombre, p.facultad, m.periodo
+        HAVING COUNT(n.id_nota) > 0
+    """)
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+ 
+    features = ["promedio_general","num_notas","prop_reprobadas",
+                "nota_minima","num_periodos","materias_desercion","sentimiento_promedio"]
+ 
+    resultado = []
+    for r in rows:
+        X = np.array([[float(r[f]) for f in features]])
+        prob = modelo.predict_proba(X)[0][1]
+        nivel = "Alto" if prob >= 0.70 else "Medio" if prob >= 0.40 else "Bajo"
+        resultado.append({
+            **r,
+            "probabilidad": round(prob * 100, 1),
+            "nivel_riesgo": nivel,
+        })
+ 
+    alto  = sum(1 for r in resultado if r["nivel_riesgo"] == "Alto")
+    medio = sum(1 for r in resultado if r["nivel_riesgo"] == "Medio")
+    bajo  = sum(1 for r in resultado if r["nivel_riesgo"] == "Bajo")
+    total = len(resultado)
+ 
+    return {
+        "precision_modelo": precision,
+        "total": total,
+        "alto":  alto,
+        "medio": medio,
+        "bajo":  bajo,
+        "pct_alto":  round(alto/total*100, 1) if total else 0,
+        "pct_medio": round(medio/total*100, 1) if total else 0,
+        "pct_bajo":  round(bajo/total*100, 1) if total else 0,
+        "estudiantes": sorted(resultado, key=lambda x: -x["probabilidad"])
+    }
+ 
+ 
+@app.get("/predicciones/estudiante/{id_estudiante}")
+def prediccion_estudiante(id_estudiante: int):
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+ 
+    cursor.execute("""
+        SELECT 
+            e.id_estudiante, e.nombre, e.genero,
+            p.nombre AS programa, p.facultad,
+            COALESCE(AVG(n.valor), 0)           AS promedio_general,
+            COUNT(n.id_nota)                     AS num_notas,
+            COALESCE(SUM(CASE WHEN n.valor < 3.0 THEN 1 ELSE 0 END)
+                / NULLIF(COUNT(n.id_nota),0), 0) AS prop_reprobadas,
+            COALESCE(MIN(n.valor), 0)            AS nota_minima,
+            COUNT(DISTINCT m.periodo)            AS num_periodos,
+            SUM(CASE WHEN m.estado='Desertor' THEN 1 ELSE 0 END) AS materias_desercion,
+            COALESCE(AVG(CASE 
+                WHEN rn.sentimiento='Positivo' THEN 1
+                WHEN rn.sentimiento='Neutro'   THEN 0
+                ELSE -1 END), 0)                AS sentimiento_promedio
+        FROM estudiante e
+        JOIN matricula m ON m.id_estudiante = e.id_estudiante
+        JOIN programa p ON p.id_programa = e.id_programa
+        LEFT JOIN nota n ON n.id_matricula = m.id_matricula
+        LEFT JOIN respuesta r ON r.id_estudiante = e.id_estudiante
+        LEFT JOIN resultado_npl rn ON rn.id_respuesta = r.id_respuesta
+        WHERE e.id_estudiante = %s
+        GROUP BY e.id_estudiante, e.nombre, e.genero, p.nombre, p.facultad
+    """, (id_estudiante,))
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+ 
+    if not row:
+        raise HTTPException(status_code=404, detail="Estudiante no encontrado")
+ 
+    modelo_data = cargar_modelo()
+    modelo      = modelo_data["modelo"]
+    features    = modelo_data["features"]
+ 
+    X    = np.array([[float(row[f]) for f in features]])
+    prob = modelo.predict_proba(X)[0][1]
+    nivel = "Alto" if prob >= 0.70 else "Medio" if prob >= 0.40 else "Bajo"
+ 
+    # Factores de riesgo basados en los datos reales
+    factores = []
+    if row["promedio_general"] < 3.0:
+        factores.append({"factor": "Bajo rendimiento académico",
+                         "intensidad": min(1, (3.0 - row["promedio_general"]) / 3.0)})
+    if row["prop_reprobadas"] > 0.3:
+        factores.append({"factor": "Alta tasa de reprobación",
+                         "intensidad": min(1, row["prop_reprobadas"])})
+    if row["materias_desercion"] > 0:
+        factores.append({"factor": "Historial de deserción",
+                         "intensidad": min(1, row["materias_desercion"] / 5)})
+    if row["sentimiento_promedio"] < -0.2:
+        factores.append({"factor": "Percepción negativa (encuestas)",
+                         "intensidad": min(1, abs(row["sentimiento_promedio"]))})
+    if row["num_notas"] < 3:
+        factores.append({"factor": "Pocas notas registradas",
+                         "intensidad": 0.5})
+ 
+    return {
+        **row,
+        "probabilidad": round(prob * 100, 1),
+        "nivel_riesgo": nivel,
+        "factores": factores,
+    }
+ 
+ 
+@app.get("/predicciones/por_programa")
+def predicciones_por_programa():
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+ 
+    modelo_data = cargar_modelo()
+    modelo      = modelo_data["modelo"]
+ 
+    cursor.execute("""
+        SELECT 
+            e.id_estudiante,
+            p.nombre AS programa,
+            p.facultad,
+            COALESCE(AVG(n.valor), 0) AS promedio_general,
+            COUNT(n.id_nota) AS num_notas,
+            COALESCE(SUM(CASE WHEN n.valor < 3.0 THEN 1 ELSE 0 END)
+                / NULLIF(COUNT(n.id_nota),0), 0) AS prop_reprobadas,
+            COALESCE(MIN(n.valor), 0) AS nota_minima,
+            COUNT(DISTINCT m.periodo) AS num_periodos,
+            SUM(CASE WHEN m.estado='Desertor' THEN 1 ELSE 0 END) AS materias_desercion,
+            COALESCE(AVG(CASE 
+                WHEN rn.sentimiento='Positivo' THEN 1
+                WHEN rn.sentimiento='Neutro'   THEN 0
+                ELSE -1 END), 0) AS sentimiento_promedio
+        FROM estudiante e
+        JOIN matricula m ON m.id_estudiante = e.id_estudiante
+        JOIN programa p ON p.id_programa = e.id_programa
+        LEFT JOIN nota n ON n.id_matricula = m.id_matricula
+        LEFT JOIN respuesta r ON r.id_estudiante = e.id_estudiante
+        LEFT JOIN resultado_npl rn ON rn.id_respuesta = r.id_respuesta
+        GROUP BY e.id_estudiante, p.nombre, p.facultad
+        HAVING COUNT(n.id_nota) > 0
+    """)
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+ 
+    features = ["promedio_general","num_notas","prop_reprobadas",
+                "nota_minima","num_periodos","materias_desercion","sentimiento_promedio"]
+ 
+    prog_map = {}
+    for r in rows:
+        X    = np.array([[float(r[f]) for f in features]])
+        prob = modelo.predict_proba(X)[0][1]
+        key  = r["programa"]
+        if key not in prog_map:
+            prog_map[key] = {"programa": r["programa"], "facultad": r["facultad"],
+                              "probs": [], "total": 0, "alto": 0}
+        prog_map[key]["probs"].append(prob)
+        prog_map[key]["total"] += 1
+        if prob >= 0.70:
+            prog_map[key]["alto"] += 1
+ 
+    resultado = []
+    for v in prog_map.values():
+        promedio_riesgo = round(sum(v["probs"]) / len(v["probs"]) * 100, 1)
+        resultado.append({
+            "programa": v["programa"],
+            "facultad": v["facultad"],
+            "total_estudiantes": v["total"],
+            "en_riesgo_alto": v["alto"],
+            "promedio_riesgo": promedio_riesgo,
+        })
+ 
+
+
+# ─── ENDPOINTS DASHBOARD  ─────────────────────────
+ 
+@app.get("/dashboard/resumen")
+def dashboard_resumen(periodo: str = "Todos"):
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    where = f"WHERE m.periodo = '{periodo}'" if periodo != "Todos" else ""
+ 
+    # KPIs principales
+    cursor.execute(f"""
+        SELECT
+            COUNT(DISTINCT m.id_estudiante) AS total_estudiantes,
+            SUM(CASE WHEN m.estado = 'Activa'    THEN 1 ELSE 0 END) AS activas,
+            SUM(CASE WHEN m.estado = 'Desertor'  THEN 1 ELSE 0 END) AS desertores,
+            SUM(CASE WHEN m.estado = 'Finalizada'THEN 1 ELSE 0 END) AS finalizadas,
+            COUNT(*) AS total_matriculas
+        FROM matricula m {where}
+    """)
+    kpis = cursor.fetchone()
+ 
+    # Promedio general
+    cursor.execute(f"""
+        SELECT ROUND(AVG(n.valor), 2) AS promedio
+        FROM nota n
+        JOIN matricula m ON m.id_matricula = n.id_matricula
+        {where}
+    """)
+    promedio = cursor.fetchone()["promedio"] or 0
+ 
+    # Tasa deserción
+    tasa = round(kpis["desertores"] / kpis["total_matriculas"] * 100, 1) if kpis["total_matriculas"] else 0
+ 
+    # Deserción por facultad
+    cursor.execute(f"""
+        SELECT p.facultad,
+            COUNT(*) AS total,
+            SUM(CASE WHEN m.estado = 'Desertor' THEN 1 ELSE 0 END) AS desertores,
+            ROUND(SUM(CASE WHEN m.estado = 'Desertor' THEN 1 ELSE 0 END) / COUNT(*) * 100, 1) AS tasa
+        FROM matricula m
+        JOIN curso c ON c.id_curso = m.id_curso
+        JOIN programa p ON p.id_programa = c.id_programa
+        {where}
+        GROUP BY p.facultad
+        ORDER BY tasa DESC
+    """)
+    por_facultad = cursor.fetchall()
+ 
+    # Matrículas por periodo
+    cursor.execute("""
+        SELECT periodo,
+            COUNT(*) AS total,
+            SUM(CASE WHEN estado = 'Desertor'   THEN 1 ELSE 0 END) AS desertores,
+            SUM(CASE WHEN estado = 'Activa'     THEN 1 ELSE 0 END) AS activas,
+            SUM(CASE WHEN estado = 'Finalizada' THEN 1 ELSE 0 END) AS finalizadas
+        FROM matricula
+        GROUP BY periodo ORDER BY periodo
+    """)
+    por_periodo = cursor.fetchall()
+ 
+    # Promedio por facultad
+    cursor.execute(f"""
+        SELECT p.facultad, ROUND(AVG(n.valor), 2) AS promedio
+        FROM nota n
+        JOIN matricula m ON m.id_matricula = n.id_matricula
+        JOIN curso c ON c.id_curso = m.id_curso
+        JOIN programa p ON p.id_programa = c.id_programa
+        {where}
+        GROUP BY p.facultad ORDER BY promedio DESC
+    """)
+    promedio_facultad = cursor.fetchall()
+ 
+    # Distribución de notas (rangos)
+    cursor.execute(f"""
+        SELECT
+            SUM(CASE WHEN n.valor >= 4.5 THEN 1 ELSE 0 END) AS excelente,
+            SUM(CASE WHEN n.valor >= 3.5 AND n.valor < 4.5 THEN 1 ELSE 0 END) AS bueno,
+            SUM(CASE WHEN n.valor >= 3.0 AND n.valor < 3.5 THEN 1 ELSE 0 END) AS aceptable,
+            SUM(CASE WHEN n.valor < 3.0 THEN 1 ELSE 0 END) AS reprobado
+        FROM nota n
+        JOIN matricula m ON m.id_matricula = n.id_matricula
+        {where}
+    """)
+    dist_notas = cursor.fetchone()
+ 
+    # Última encuesta
+    cursor.execute("""
+        SELECT e.nombre,
+            SUM(CASE WHEN rn.sentimiento = 'Positivo' THEN 1 ELSE 0 END) AS positivo,
+            SUM(CASE WHEN rn.sentimiento = 'Neutro'   THEN 1 ELSE 0 END) AS neutro,
+            SUM(CASE WHEN rn.sentimiento = 'Negativo' THEN 1 ELSE 0 END) AS negativo,
+            COUNT(*) AS total
+        FROM encuesta e
+        JOIN pregunta p ON p.id_encuesta = e.id_encuesta
+        JOIN respuesta r ON r.id_pregunta = p.id_pregunta
+        JOIN resultado_npl rn ON rn.id_respuesta = r.id_respuesta
+        GROUP BY e.id_encuesta, e.nombre
+        ORDER BY e.fecha DESC LIMIT 1
+    """)
+    ultima_encuesta = cursor.fetchone()
+    if ultima_encuesta and ultima_encuesta["total"]:
+        t = ultima_encuesta["total"]
+        ultima_encuesta["pct_positivo"] = round(ultima_encuesta["positivo"] / t * 100)
+        ultima_encuesta["pct_neutro"]   = round(ultima_encuesta["neutro"]   / t * 100)
+        ultima_encuesta["pct_negativo"] = round(ultima_encuesta["negativo"] / t * 100)
+ 
+    # Estudiantes en riesgo alto (del modelo si existe)
+    try:
+        modelo_data = cargar_modelo()
+        modelo      = modelo_data["modelo"]
+        features    = modelo_data["features"]
+        cursor.execute("""
+            SELECT e.id_estudiante, e.nombre, p.nombre AS programa, p.facultad,
+                COALESCE(AVG(n.valor), 0) AS promedio_general,
+                COUNT(n.id_nota) AS num_notas,
+                COALESCE(SUM(CASE WHEN n.valor < 3.0 THEN 1 ELSE 0 END)
+                    / NULLIF(COUNT(n.id_nota),0), 0) AS prop_reprobadas,
+                COALESCE(MIN(n.valor), 0) AS nota_minima,
+                COUNT(DISTINCT m.periodo) AS num_periodos,
+                SUM(CASE WHEN m.estado='Desertor' THEN 1 ELSE 0 END) AS materias_desercion,
+                COALESCE(AVG(CASE WHEN rn.sentimiento='Positivo' THEN 1
+                    WHEN rn.sentimiento='Neutro' THEN 0 ELSE -1 END), 0) AS sentimiento_promedio
+            FROM estudiante e
+            JOIN matricula m ON m.id_estudiante = e.id_estudiante
+            JOIN programa p ON p.id_programa = e.id_programa
+            LEFT JOIN nota n ON n.id_matricula = m.id_matricula
+            LEFT JOIN respuesta r ON r.id_estudiante = e.id_estudiante
+            LEFT JOIN resultado_npl rn ON rn.id_respuesta = r.id_respuesta
+            GROUP BY e.id_estudiante, e.nombre, p.nombre, p.facultad
+            HAVING COUNT(n.id_nota) > 0
+        """)
+        est_rows = cursor.fetchall()
+        en_riesgo = []
+        for r in est_rows:
+            X    = [[float(r[f]) for f in features]]
+            prob = modelo.predict_proba(X)[0][1]
+            if prob >= 0.70:
+                en_riesgo.append({
+                    "nombre": r["nombre"], "programa": r["programa"],
+                    "facultad": r["facultad"], "probabilidad": round(prob*100,1),
+                    "nivel_riesgo": "Alto"
+                })
+        en_riesgo = sorted(en_riesgo, key=lambda x: -x["probabilidad"])[:6]
+    except Exception:
+        en_riesgo = []
+ 
+    cursor.close()
+    conn.close()
+    return {
+        "kpis": {**kpis, "promedio": promedio, "tasa_desercion": tasa},
+        "por_facultad": por_facultad,
+        "por_periodo": por_periodo,
+        "promedio_facultad": promedio_facultad,
+        "dist_notas": dist_notas,
+        "ultima_encuesta": ultima_encuesta,
+        "en_riesgo": en_riesgo,
     }
 
 

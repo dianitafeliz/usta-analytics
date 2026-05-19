@@ -5,6 +5,7 @@ import Dashboard from "./components/Dashboard";
 import Reportes from "./components/Reportes";
 import Encuestas from "./components/Encuestas";
 import Academico from "./components/Academico";
+import Predicciones from "./components/Predicciones";
 import "./styles/App.css";
 
 
@@ -16,7 +17,8 @@ function App() {
         <div className="content">
           <Routes>
             <Route path="/" element={<Dashboard />} />
-            <Route path="/reportes" element={<Reportes />} />
+            <Route path="/desercion" element={<Reportes />} />
+            <Route path="/predicciones" element={<Predicciones />} /> 
             <Route path="/encuestas" element={<Encuestas />} />
             <Route path="/academico" element={<Academico />} />
           </Routes>
